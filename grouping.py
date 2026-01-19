@@ -2,425 +2,396 @@
 import math
 import numpy as np
 import pandas as pd
+
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.neighbors import BallTree
+
 import folium
-from folium.plugins import HeatMap, Search
+from folium.plugins import MarkerCluster, Search
 
-# -------------------------
-# Helpers: sanitize + validate
-# -------------------------
-REQUIRED_COLS = ["nama_toko", "lat", "long"]
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("\u00a0", " ", regex=False)
-        .str.strip()
-        .str.lower()
-    )
-    return df
-
-def validate_input_df(df_raw: pd.DataFrame):
+# =========================================================
+# Utils
+# =========================================================
+def _to_float_series(s: pd.Series) -> pd.Series:
     """
-    Return: (ok: bool, message: str, df_clean: DataFrame|None)
+    Convert series that may contain decimal commas into float.
+    Examples: "107,1234" -> 107.1234
     """
-    df = normalize_columns(df_raw)
+    s2 = s.astype(str).str.strip()
+    s2 = s2.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s2, errors="coerce")
 
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        return (False,
-                f"Kolom wajib tidak ada: {missing}\n\n"
-                f"Kolom yang terbaca: {df.columns.tolist()}\n\n"
-                "Format wajib: nama_toko | lat | long (kategori optional)",
-                None)
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    # lat/lon degrees -> km
+    R = 6371.0088
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+    return 2*R*math.asin(math.sqrt(a))
 
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["long"] = pd.to_numeric(df["long"], errors="coerce")
+def _format_group_labels(labels: np.ndarray, K: int) -> pd.Series:
+    # 0..K-1 -> R01..R{K}
+    return pd.Series([f"R{int(x)+1:02d}" for x in labels])
 
-    bad_num = df[df["lat"].isna() | df["long"].isna()]
-    if len(bad_num) > 0:
-        return (False, f"Ada {len(bad_num)} baris lat/long kosong atau bukan angka.", None)
-
-    bad_range = df[~df["lat"].between(-90, 90) | ~df["long"].between(-180, 180)]
-    if len(bad_range) > 0:
-        return (False, f"Ada {len(bad_range)} baris lat/long di luar range valid.", None)
-
-    if len(df) < 10:
-        return (False, "Data terlalu sedikit (<10 baris).", None)
-
-    df["nama_toko"] = df["nama_toko"].astype(str)
-
-    return (True, "OK", df)
-
-# -------------------------
-# Core algo (punya kamu)
-# -------------------------
-EARTH_R_KM = 6371.0088
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
-    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
-    c = 2*np.arcsin(np.minimum(1.0, np.sqrt(a)))
-    return EARTH_R_KM * c
-
-def pairwise_dist(coords_latlon):
-    n = coords_latlon.shape[0]
-    D = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        D[i] = haversine_km(
-            coords_latlon[i,0], coords_latlon[i,1],
-            coords_latlon[:,0], coords_latlon[:,1]
-        )
-    return D
-
-def balanced_targets(n, k, hard_cap):
-    base = n // k
-    rem  = n % k
-    t = np.array([base + 1 if i < rem else base for i in range(k)], dtype=int)
-    if t.max() > hard_cap:
-        raise ValueError(f"Target rata {t.max()} > HARD_CAP={hard_cap}. Naikkan K atau HARD_CAP.")
-    return t
-
-def pick_seeds_kpp(D, k, seed=42):
-    rng = np.random.default_rng(seed)
-    n = D.shape[0]
-    seeds = [int(rng.integers(0, n))]
-    for _ in range(1, k):
-        dmin = np.min(D[:, seeds], axis=1)
-        probs = (dmin ** 2)
-        s = probs.sum()
-        if s <= 0:
-            cand = int(rng.integers(0, n))
-        else:
-            probs = probs / s
-            cand = int(rng.choice(n, p=probs))
-        seeds.append(cand)
-    return seeds
-
-def region_grow_balanced(D, k, targets, seed=42):
-    n = D.shape[0]
-    seeds = pick_seeds_kpp(D, k, seed=seed)
-
-    labels = np.full(n, -1, dtype=int)
-    members = [set() for _ in range(k)]
-    fill = np.zeros(k, dtype=int)
-
-    for gi, idx in enumerate(seeds):
-        labels[idx] = gi
-        members[gi].add(idx)
-        fill[gi] += 1
-
-    unassigned = set(range(n)) - set(seeds)
-
-    best_dist = np.full(n, np.inf, dtype=float)
-    best_group = np.full(n, -1, dtype=int)
-    for i in unassigned:
-        ds = [D[i, seeds[g]] for g in range(k)]
-        gmin = int(np.argmin(ds))
-        best_dist[i] = float(ds[gmin])
-        best_group[i] = gmin
-
-    def try_update_point(i, g, new_member):
-        d = float(D[i, new_member])
-        if d < best_dist[i]:
-            best_dist[i] = d
-            best_group[i] = g
-
-    while unassigned:
-        cand_i = None
-        cand_d = np.inf
-
-        for i in unassigned:
-            g = int(best_group[i])
-            if g != -1 and fill[g] < targets[g]:
-                d = best_dist[i]
-                if d < cand_d:
-                    cand_d = d
-                    cand_i = i
-
-        if cand_i is None:
-            i = next(iter(unassigned))
-            best_g = None
-            best_d2 = np.inf
-            for g in range(k):
-                if fill[g] >= targets[g]:
-                    continue
-                dmin = np.inf
-                for m in members[g]:
-                    dm = D[i, m]
-                    if dm < dmin:
-                        dmin = dm
-                if dmin < best_d2:
-                    best_d2 = dmin
-                    best_g = g
-            if best_g is None:
-                break
-            cand_i, cand_g = i, best_g
-        else:
-            cand_g = int(best_group[cand_i])
-
-        labels[cand_i] = cand_g
-        members[cand_g].add(cand_i)
-        fill[cand_g] += 1
-        unassigned.remove(cand_i)
-
-        for i in unassigned:
-            try_update_point(i, cand_g, cand_i)
-
-    return labels
-
-def repair_islands(D, labels, max_link_km=6.0, passes=6):
-    n = len(labels)
-    k = int(labels.max()) + 1
-
-    for _ in range(passes):
-        moved = False
-        members = [np.where(labels == g)[0] for g in range(k)]
-
-        for i in range(n):
-            g = int(labels[i])
-            if len(members[g]) <= 1:
-                continue
-
-            others = members[g][members[g] != i]
-            min_self = float(np.min(D[i, others]))
-
-            if min_self <= max_link_km:
-                continue
-
-            best_g = g
-            best_d = min_self
-            for gg in range(k):
-                if gg == g or len(members[gg]) == 0:
-                    continue
-                mmin = float(np.min(D[i, members[gg]]))
-                if mmin < best_d:
-                    best_d = mmin
-                    best_g = gg
-
-            if best_g != g:
-                labels[i] = best_g
-                moved = True
-
-        if not moved:
-            break
-
-    return labels
-
-def majority_neighbor_reassign(D, labels, k_neighbors=8, passes=3, hard_cap=30):
-    n = len(labels)
-    k = int(labels.max()) + 1
-
-    for _ in range(passes):
-        counts = np.bincount(labels, minlength=k)
-        changed = False
-
-        for i in range(n):
-            nn = np.argsort(D[i])[1:k_neighbors+1]
-            nn_labels = labels[nn]
-            vote = np.bincount(nn_labels, minlength=k)
-            best = int(np.argmax(vote))
-
-            if best != labels[i]:
-                if counts[best] < hard_cap:
-                    counts[labels[i]] -= 1
-                    labels[i] = best
-                    counts[best] += 1
-                    changed = True
-
-        if not changed:
-            break
-
-    return labels
-
-def chain_order_centroids(centroids_latlon):
-    cents = np.array(centroids_latlon)
-    k = len(cents)
-    overall = cents.mean(axis=0)
-    start = int(np.argmin(haversine_km(np.full(k, overall[0]), np.full(k, overall[1]), cents[:,0], cents[:,1])))
-
-    remaining = set(range(k))
-    order = [start]
-    remaining.remove(start)
-
-    while remaining:
-        last = order[-1]
-        rem = np.array(sorted(list(remaining)))
-        d = haversine_km(np.full(len(rem), cents[last,0]), np.full(len(rem), cents[last,1]), cents[rem,0], cents[rem,1])
-        nxt = int(rem[np.argmin(d)])
-        order.append(nxt)
-        remaining.remove(nxt)
-    return order
-
-# -------------------------
-# Hull + buffer (arsiran)
-# -------------------------
-def _cross(o, a, b):
-    return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
-
-def convex_hull_lonlat(points_lonlat):
-    pts = sorted(set(points_lonlat))
-    if len(pts) <= 2:
-        return pts
-    lower = []
-    for p in pts:
-        while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-    upper = []
-    for p in reversed(pts):
-        while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-    return lower[:-1] + upper[:-1]
-
-def km_to_deg_lat(km): return km / 111.32
-def km_to_deg_lon(km, lat): return km / (111.32 * max(0.2, math.cos(math.radians(lat))))
-
-def buffer_hull(hull_lonlat, buffer_km):
-    if len(hull_lonlat) < 3:
-        return hull_lonlat
-    lons = np.array([p[0] for p in hull_lonlat])
-    lats = np.array([p[1] for p in hull_lonlat])
-    c_lon = float(lons.mean())
-    c_lat = float(lats.mean())
-    buf_lon = km_to_deg_lon(buffer_km, c_lat)
-    buf_lat = km_to_deg_lat(buffer_km)
-
+def _palette(n: int):
+    # nice distinct colors (repeat if needed)
+    base = [
+        "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b",
+        "#e377c2","#7f7f7f","#bcbd22","#17becf",
+        "#0b3d91","#ff1493","#228b22","#ff4500","#6a5acd","#2f4f4f",
+        "#b8860b","#008080","#483d8b","#a52a2a",
+    ]
     out = []
-    for lon, lat in hull_lonlat:
-        vlon = lon - c_lon
-        vlat = lat - c_lat
-        norm = math.sqrt(vlon*vlon + vlat*vlat) + 1e-12
-        out.append((lon + (vlon/norm)*buf_lon, lat + (vlat/norm)*buf_lat))
+    for i in range(n):
+        out.append(base[i % len(base)])
     return out
 
-# -------------------------
+# =========================================================
+# Validation
+# =========================================================
+def validate_input_df(df: pd.DataFrame):
+    """
+    Expect columns: nama_toko, lat, long
+    Accept some alternatives: nama toko / latitude / longitude etc (case-insensitive)
+    Handles decimal comma for lat/long.
+    """
+    if df is None or len(df) == 0:
+        return False, "File kosong.", None
+
+    cols = {c.lower().strip(): c for c in df.columns}
+
+    # map possible column names
+    cand_name = ["nama_toko", "nama toko", "toko", "store", "name", "nama"]
+    cand_lat  = ["lat", "latitude", "y"]
+    cand_lon  = ["long", "lon", "longitude", "lng", "x"]
+
+    def pick(cands):
+        for c in cands:
+            if c in cols:
+                return cols[c]
+        return None
+
+    c_name = pick(cand_name)
+    c_lat  = pick(cand_lat)
+    c_lon  = pick(cand_lon)
+
+    if not c_name or not c_lat or not c_lon:
+        return (
+            False,
+            "Kolom wajib tidak ditemukan.\n\n"
+            "Wajib ada: **nama_toko**, **lat**, **long**.\n"
+            "Contoh header: nama_toko | lat | long",
+            None
+        )
+
+    df2 = df[[c_name, c_lat, c_lon]].copy()
+    df2.columns = ["nama_toko", "lat", "long"]
+
+    # convert lat/long
+    df2["lat"] = _to_float_series(df2["lat"])
+    df2["long"] = _to_float_series(df2["long"])
+
+    # drop invalid
+    bad = df2["lat"].isna() | df2["long"].isna() | df2["nama_toko"].isna()
+    df_bad = df2[bad]
+    df2 = df2[~bad].copy()
+
+    if len(df2) == 0:
+        return False, "Semua baris invalid setelah parsing lat/long. Pastikan lat/long angka.", None
+
+    # range check
+    out_range = (df2["lat"].abs() > 90) | (df2["long"].abs() > 180)
+    if out_range.any():
+        ex = df2.loc[out_range].head(5)
+        return (
+            False,
+            "Ada lat/long di luar range valid.\n"
+            "Lat harus -90..90, Long harus -180..180.\n\nContoh baris bermasalah:\n"
+            f"{ex.to_string(index=False)}",
+            None
+        )
+
+    msg = f"OK. Baris valid: {len(df2):,}. Baris dibuang (invalid): {len(df_bad):,}."
+    return True, msg, df2
+
+# =========================================================
+# Core grouping algorithm
+# =========================================================
+def _initial_kmeans(coords_deg: np.ndarray, K: int, seed: int = 42) -> np.ndarray:
+    """
+    coords_deg: Nx2 [lat, lon]
+    """
+    X = coords_deg.astype(float)
+    km = MiniBatchKMeans(n_clusters=K, random_state=seed, n_init="auto", batch_size=1024)
+    labels = km.fit_predict(X)
+    return labels
+
+def _compute_centroids(coords_deg: np.ndarray, labels: np.ndarray, K: int) -> np.ndarray:
+    centroids = np.zeros((K, 2), dtype=float)
+    for g in range(K):
+        idx = np.where(labels == g)[0]
+        if len(idx) == 0:
+            centroids[g] = coords_deg.mean(axis=0)
+        else:
+            centroids[g] = coords_deg[idx].mean(axis=0)
+    return centroids
+
+def _enforce_cap(coords_deg: np.ndarray, labels: np.ndarray, K: int, hard_cap: int) -> np.ndarray:
+    """
+    If any cluster > hard_cap, push farthest-from-centroid points into other clusters with available capacity.
+    """
+    n = len(labels)
+    if K * hard_cap < n:
+        raise ValueError(f"K*cap tidak cukup. K={K}, cap={hard_cap}, total={n}. Minimal cap={math.ceil(n/K)}")
+
+    labels = labels.copy()
+    counts = np.bincount(labels, minlength=K)
+    centroids = _compute_centroids(coords_deg, labels, K)
+
+    # Build overflow list
+    overflow = []
+    for g in range(K):
+        if counts[g] > hard_cap:
+            idx = np.where(labels == g)[0]
+            # distance to centroid (rough Euclidean in deg; OK for ordering)
+            d = np.linalg.norm(coords_deg[idx] - centroids[g], axis=1)
+            order = np.argsort(d)[::-1]  # farthest first
+            move_n = counts[g] - hard_cap
+            to_move = idx[order[:move_n]]
+            for i in to_move:
+                overflow.append(i)
+            labels[to_move] = -1
+            counts[g] -= move_n
+
+    if not overflow:
+        return labels
+
+    # Assign overflow points to nearest centroid with room
+    centroids = _compute_centroids(coords_deg, labels, K)  # recompute after removing
+    for i in overflow:
+        p = coords_deg[i]
+        # candidate groups sorted by distance to centroid
+        dist = np.linalg.norm(centroids - p, axis=1)
+        order = np.argsort(dist)
+        placed = False
+        for g in order:
+            if counts[g] < hard_cap:
+                labels[i] = g
+                counts[g] += 1
+                placed = True
+                break
+        if not placed:
+            # should not happen if K*cap >= n
+            raise RuntimeError("Tidak ada group yang punya slot kosong saat enforce cap.")
+
+    return labels
+
+def _refine_local(
+    coords_deg: np.ndarray,
+    labels: np.ndarray,
+    K: int,
+    hard_cap: int,
+    refine_iter: int = 6,
+    neighbor_k: int = 10,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Iterative local refinement:
+    - Precompute kNN (haversine) for each point
+    - Each iter: each point votes candidate group by neighbors (weighted by 1/(dist+eps))
+    - Move if it improves distance-to-centroid and target group has room (cap)
+    """
+    rng = np.random.default_rng(seed)
+    n = len(labels)
+
+    if refine_iter <= 0:
+        return labels
+
+    # BallTree expects radians for haversine
+    coords_rad = np.radians(coords_deg)
+    tree = BallTree(coords_rad, metric="haversine")
+
+    # query k+1 because first neighbor is itself
+    kq = min(max(2, neighbor_k + 1), n)
+    dists, nbrs = tree.query(coords_rad, k=kq)  # distances in radians
+    # convert to km
+    dists_km = dists * 6371.0088
+
+    labels = labels.copy()
+    counts = np.bincount(labels, minlength=K)
+
+    for it in range(refine_iter):
+        centroids = _compute_centroids(coords_deg, labels, K)
+
+        order = np.arange(n)
+        rng.shuffle(order)
+
+        moved = 0
+
+        for i in order:
+            gi = labels[i]
+
+            # do not allow emptying a cluster completely (optional safety)
+            if counts[gi] <= 1:
+                continue
+
+            nb_idx = nbrs[i, 1:]  # exclude itself
+            nb_dist = dists_km[i, 1:]
+
+            # neighbor group scores (weighted)
+            scores = np.zeros(K, dtype=float)
+            w = 1.0 / (nb_dist + 1e-6)
+            nb_labels = labels[nb_idx]
+            for lab, ww in zip(nb_labels, w):
+                scores[lab] += ww
+
+            # candidate groups sorted by score desc
+            cand = np.argsort(scores)[::-1]
+
+            # current distance to own centroid
+            p = coords_deg[i]
+            cur_d = np.linalg.norm(p - centroids[gi])
+
+            # try best candidate(s)
+            best_g = gi
+            best_d = cur_d
+
+            for g in cand[:5]:  # limit tries
+                if g == gi:
+                    continue
+                if counts[g] >= hard_cap:
+                    continue
+                new_d = np.linalg.norm(p - centroids[g])
+                # must improve noticeably (avoid jitter)
+                if new_d + 1e-9 < best_d:
+                    best_d = new_d
+                    best_g = g
+
+            if best_g != gi:
+                labels[i] = best_g
+                counts[gi] -= 1
+                counts[best_g] += 1
+                moved += 1
+
+        print(f"[REFINE] iter {it+1}/{refine_iter}: moved={moved}")
+        if moved == 0:
+            break
+
+    return labels
+
+# =========================================================
 # Map builder
-# -------------------------
-def build_map(df, cats, name_col="nama_toko", lat_col="lat", lon_col="long", cat_col="kategori",
-              boundary_buffer_km=1.2, default_zoom=11):
-    palette = [
-        "red","blue","green","purple","orange","darkred","lightred","beige",
-        "darkblue","darkgreen","cadetblue","darkpurple","pink","lightblue",
-        "lightgreen","gray","black","lightgray"
-    ]
-    color_map = {cat: palette[i % len(palette)] for i, cat in enumerate(cats)}
+# =========================================================
+def _build_map(df_result: pd.DataFrame, K: int):
+    center_lat = df_result["lat"].mean()
+    center_lon = df_result["long"].mean()
 
-    m = folium.Map(location=[df[lat_col].mean(), df[lon_col].mean()],
-                   zoom_start=default_zoom, control_scale=True)
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=11, control_scale=True, tiles="OpenStreetMap")
+    colors = _palette(K)
 
-    boundary_layer = folium.FeatureGroup(name="Batas Group (Hull)", show=True)
-    m.add_child(boundary_layer)
+    # layer: markers by group
+    for g in range(K):
+        code = f"R{g+1:02d}"
+        fg = folium.FeatureGroup(name=f"{code} (toko)", show=True)
+        mc = MarkerCluster(name=f"{code} cluster", disableClusteringAtZoom=14)
 
-    layers = {}
-    for cat in cats:
-        fg = folium.FeatureGroup(name=f"{cat} (toko)", show=True)
-        m.add_child(fg)
-        layers[cat] = fg
+        sub = df_result[df_result["kategori"] == code]
+        for _, r in sub.iterrows():
+            folium.CircleMarker(
+                location=[r["lat"], r["long"]],
+                radius=5,
+                color=colors[g],
+                fill=True,
+                fill_opacity=0.9,
+                tooltip=f"{r['nama_toko']} ({code})",
+                popup=folium.Popup(
+                    f"<b>{r['nama_toko']}</b><br>"
+                    f"Group: {code}<br>"
+                    f"Index: {int(r['_idx'])}<br>",
+                    max_width=300
+                ),
+            ).add_to(mc)
 
-    search_layer = folium.FeatureGroup(name="Cari Toko (Search)", show=True)
-    m.add_child(search_layer)
+        mc.add_to(fg)
+        fg.add_to(m)
 
-    for _, r in df.iterrows():
-        nm  = str(r.get(name_col, "(tanpa nama)"))
-        lat = float(r[lat_col]); lon = float(r[lon_col])
-        cat = str(r[cat_col])
-
-        gmaps = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-        popup = f"""
-        <div style="min-width:220px">
-          <div style="font-weight:700;margin-bottom:6px;">{nm}</div>
-          <div style="margin-bottom:4px;">Kategori: <b>{cat}</b></div>
-          <div style="margin-bottom:6px;">Lat,Lon: {lat:.6f}, {lon:.6f}</div>
-          <a href="{gmaps}" target="_blank"
-             style="text-decoration:none;background:#1a73e8;color:white;padding:6px 10px;border-radius:6px;display:inline-block;">
-             Buka di Google Maps
-          </a>
-        </div>
-        """
+    # Search by nama_toko (use hidden layer)
+    search_fg = folium.FeatureGroup(name="Cari Toko (Search)", show=True)
+    for _, r in df_result.iterrows():
         folium.Marker(
-            [lat, lon],
-            popup=folium.Popup(popup, max_width=340),
-            icon=folium.Icon(color=color_map.get(cat, "gray"), icon="info-sign")
-        ).add_to(layers.get(cat, boundary_layer))
+            location=[r["lat"], r["long"]],
+            tooltip=r["nama_toko"],
+            icon=folium.Icon(color="blue", icon="info-sign"),
+        ).add_to(search_fg)
+    search_fg.add_to(m)
 
-        folium.CircleMarker([lat, lon], radius=3, fill=True, fill_opacity=0.0,
-                            opacity=0.0, tooltip=nm).add_to(search_layer)
+    Search(
+        layer=search_fg,
+        search_label="tooltip",
+        placeholder="Cari nama toko ...",
+        collapsed=False,
+    ).add_to(m)
 
-    for cat in cats:
-        sub = df[df[cat_col] == cat]
-        if len(sub) < 3:
-            continue
-        pts = list(zip(sub[lon_col].astype(float).tolist(), sub[lat_col].astype(float).tolist()))
-        hull = convex_hull_lonlat(pts)
-        hull = buffer_hull(hull, boundary_buffer_km)
-        hull_latlon = [(lat, lon) for lon, lat in hull]
-        folium.Polygon(
-            locations=hull_latlon,
-            color=color_map[cat],
-            weight=2,
-            fill=True,
-            fill_opacity=0.18,
-            popup=cat
-        ).add_to(boundary_layer)
-
-    HeatMap(df[[lat_col, lon_col]].dropna().values.tolist(),
-            name="Heatmap", radius=18, blur=22, max_zoom=18).add_to(m)
-
-    Search(layer=search_layer, search_label="tooltip",
-           placeholder="Cari nama toko…", collapsed=False, position="topleft").add_to(m)
-
-    bounds = [[df[lat_col].min(), df[lon_col].min()],
-              [df[lat_col].max(), df[lon_col].max()]]
-    m.fit_bounds(bounds)
-    folium.LayerControl(collapsed=False, position="topleft").add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
-# -------------------------
-# MAIN FUNCTION for Streamlit
-# -------------------------
+# =========================================================
+# Main API
+# =========================================================
 def process_excel(
-    df_in: pd.DataFrame,
-    hard_cap: int = 25,
-    K: int = 12,
-    seed: int = 42,
-    island_max_link_km: float = 6.0,
-    island_passes: int = 8,
-    k_neighbors: int = 8,
-    neighbor_passes: int = 3,
-    boundary_buffer_km: float = 1.2,
-    default_zoom: int = 11,
+    df_clean: pd.DataFrame,
+    hard_cap: int,
+    K: int,
+    refine_iter: int = 6,
+    neighbor_k: int = 10,
+    seed: int = 42
 ):
     """
-    Input  : df (sudah punya kolom nama_toko, lat, long)
-    Output : (df_result, folium_map)
+    Returns: (df_result, folium_map)
+    df_result includes:
+      - nama_toko, lat, long, kategori
     """
-    df = normalize_columns(df_in).copy()
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["long"] = pd.to_numeric(df["long"], errors="coerce")
-    df = df[df["lat"].between(-90, 90) & df["long"].between(-180, 180)].dropna(subset=["lat", "long"]).copy()
 
-    coords = df[["lat", "long"]].to_numpy(dtype=float)
+    dfw = df_clean.copy().reset_index(drop=True)
+    dfw["_idx"] = np.arange(len(dfw))
+
+    coords = dfw[["lat", "long"]].to_numpy(dtype=float)
     n = len(coords)
 
-    targets = balanced_targets(n, K, hard_cap)
+    if K < 2:
+        raise ValueError("K minimal 2.")
+    if hard_cap < 2:
+        raise ValueError("cap minimal 2.")
+    if K * hard_cap < n:
+        raise ValueError(f"K*cap tidak cukup. K={K}, cap={hard_cap}, total={n}.")
 
-    D = pairwise_dist(coords)
+    print(f"[INFO] n={n} | K={K} | cap={hard_cap} | refine_iter={refine_iter} | neighbor_k={neighbor_k}")
 
-    labels = region_grow_balanced(D, K, targets, seed=seed)
-    labels = repair_islands(D, labels, max_link_km=island_max_link_km, passes=island_passes)
-    labels = majority_neighbor_reassign(D, labels, k_neighbors=k_neighbors, passes=neighbor_passes, hard_cap=hard_cap)
+    # 1) initial clustering
+    labels = _initial_kmeans(coords, K=K, seed=seed)
 
-    cents = [coords[labels == g].mean(axis=0) for g in range(K)]
-    order = chain_order_centroids(cents)
-    remap = {old: new for new, old in enumerate(order)}
+    # 2) enforce cap
+    labels = _enforce_cap(coords, labels, K=K, hard_cap=hard_cap)
 
-    df["kategori"] = [f"R{remap[int(l)]+1:02d}" for l in labels]
-    cats = [f"R{i+1:02d}" for i in range(K)]
+    # 3) iterative local refinement (the key to reduce "lompat")
+    labels = _refine_local(
+        coords_deg=coords,
+        labels=labels,
+        K=K,
+        hard_cap=hard_cap,
+        refine_iter=int(refine_iter),
+        neighbor_k=int(neighbor_k),
+        seed=seed
+    )
 
-    m = build_map(df, cats, boundary_buffer_km=boundary_buffer_km, default_zoom=default_zoom)
-    return df, m
+    # final enforce (safety)
+    labels = _enforce_cap(coords, labels, K=K, hard_cap=hard_cap)
+
+    dfw["kategori"] = _format_group_labels(labels, K=K).values
+
+    # build map
+    m = _build_map(dfw, K=K)
+
+    return dfw[["nama_toko", "lat", "long", "kategori", "_idx"]].copy(), m
