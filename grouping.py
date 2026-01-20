@@ -433,3 +433,15 @@ def initial_grouping(
 
     dfw["kategori"] = dfw["_gidx"].apply(label_from_gidx)
     return dfw, applied, skipped
+# =========================================================
+# Compatibility wrappers (biar app.py versi baru tetap jalan)
+# =========================================================
+def initial_grouping(df_clean: pd.DataFrame, K: int, hard_cap: int, **kwargs):
+    # kalau core kamu namanya process_excel, pakai itu
+    return process_excel(df_clean, hard_cap=hard_cap, K=K)
+
+def run_grouping_pipeline(df_clean: pd.DataFrame, K: int, hard_cap: int, **kwargs):
+    return process_excel(df_clean, hard_cap=hard_cap, K=K)
+
+def label_from_gidx(gidx: int) -> str:
+    return f"R{int(gidx)+1:02d}"
