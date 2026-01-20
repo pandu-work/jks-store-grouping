@@ -14,7 +14,6 @@ from folium.plugins import Search
 # Parsing / Validation
 # =========================================================
 def _to_float_series(s: pd.Series) -> pd.Series:
-    # supports decimal comma: "107,123" -> "107.123"
     s2 = s.astype(str).str.strip().str.replace(",", ".", regex=False)
     return pd.to_numeric(s2, errors="coerce")
 
@@ -31,16 +30,12 @@ def validate_input_df(df: pd.DataFrame):
                 return cols[c]
         return None
 
-    c_name = pick(["nama_toko", "nama toko", "toko", "store", "outlet", "nama_outlet", "nama outlet", "name"])
+    c_name = pick(["nama_toko", "nama toko", "toko", "store", "outlet", "name"])
     c_lat = pick(["lat", "latitude", "y"])
     c_lon = pick(["long", "lon", "longitude", "lng", "x"])
 
     if not c_name or not c_lat or not c_lon:
-        return (
-            False,
-            "Kolom wajib tidak ditemukan.\n\nWajib ada: **nama_toko**, **lat**, **long**.",
-            None,
-        )
+        return False, "Kolom wajib: nama_toko | lat | long", None
 
     df2 = df[[c_name, c_lat, c_lon]].copy()
     df2.columns = ["nama_toko", "lat", "long"]
@@ -48,8 +43,6 @@ def validate_input_df(df: pd.DataFrame):
     df2["nama_toko"] = df2["nama_toko"].astype(str).str.strip()
     df2["lat"] = _to_float_series(df2["lat"])
     df2["long"] = _to_float_series(df2["long"])
-
-    # attach stable row_id from original order
     df2["_row_id"] = np.arange(len(df2), dtype=int)
 
     bad = df2["nama_toko"].eq("") | df2["lat"].isna() | df2["long"].isna()
@@ -57,30 +50,24 @@ def validate_input_df(df: pd.DataFrame):
     df2 = df2.loc[~bad].copy()
 
     if len(df2) == 0:
-        return False, "Semua baris invalid setelah parsing lat/long. Pastikan lat/long angka.", None
+        return False, "Semua baris invalid setelah parsing lat/long.", None
 
     out_range = (df2["lat"].abs() > 90) | (df2["long"].abs() > 180)
     if out_range.any():
         ex = df2.loc[out_range].head(8)
-        return (
-            False,
-            "Ada lat/long di luar range valid.\nLat harus -90..90, Long harus -180..180.\n\n"
-            f"Contoh baris bermasalah:\n{ex.to_string(index=False)}",
-            None,
-        )
+        return False, f"Ada lat/long di luar range valid.\n\n{ex.to_string(index=False)}", None
 
     return True, f"OK. Baris valid: {len(df2):,}. Baris dibuang: {bad_n:,}.", df2
 
 
 # =========================================================
-# Labels + Colors + Legend
+# Labels / Colors
 # =========================================================
 def label_from_gidx(gidx: int) -> str:
     return f"R{int(gidx) + 1:02d}"
 
 
 def parse_label_to_gidx(label: str) -> int:
-    # "R11" -> 10
     return int(label.replace("R", "")) - 1
 
 
@@ -106,18 +93,11 @@ def _add_legend(m: folium.Map, K: int, colors):
     )
     legend_html = f"""
     <div style="
-      position: fixed;
-      bottom: 18px;
-      left: 18px;
-      z-index: 9999;
+      position: fixed; bottom: 18px; left: 18px; z-index: 9999;
       background: rgba(255,255,255,0.92);
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid #ddd;
-      max-height: 260px;
-      overflow: auto;
-      box-shadow: 0 4px 14px rgba(0,0,0,0.12);
-      ">
+      padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd;
+      max-height: 260px; overflow: auto;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.12);">
       <div style="font-weight:600;margin-bottom:8px;">Legend (Group)</div>
       {items}
     </div>
@@ -126,8 +106,7 @@ def _add_legend(m: folium.Map, K: int, colors):
 
 
 # =========================================================
-# Convex Hull (Monotonic Chain) — no extra deps
-# points: (lon, lat)
+# Convex Hull (Monotonic Chain)
 # =========================================================
 def _convex_hull(points):
     points = sorted(set(points))
@@ -153,16 +132,13 @@ def _convex_hull(points):
 
 
 # =========================================================
-# Core math helpers
+# Core helpers
 # =========================================================
 def _compute_centroids(coords_deg: np.ndarray, labels: np.ndarray, K: int) -> np.ndarray:
     centroids = np.zeros((K, 2), dtype=float)
     for g in range(K):
         idx = np.where(labels == g)[0]
-        if len(idx) == 0:
-            centroids[g] = coords_deg.mean(axis=0)
-        else:
-            centroids[g] = coords_deg[idx].mean(axis=0)
+        centroids[g] = coords_deg[idx].mean(axis=0) if len(idx) else coords_deg.mean(axis=0)
     return centroids
 
 
@@ -173,14 +149,9 @@ def _initial_centroids_kmeans(coords_deg: np.ndarray, K: int, seed: int = 42) ->
 
 
 def _balanced_assign(coords_deg: np.ndarray, centroids: np.ndarray, K: int, cap: int, soft_target: int):
-    """
-    Assign each point to nearest centroid with capacity.
-    Try to keep <= soft_target first (balanced), then allow up to cap.
-    """
     n = len(coords_deg)
     d = np.linalg.norm(coords_deg[:, None, :] - centroids[None, :, :], axis=2)
 
-    # order points by confidence (gap between 1st and 2nd nearest)
     part = np.partition(d, 1, axis=1)
     gap = part[:, 1] - part[:, 0]
     order = np.argsort(gap)[::-1]
@@ -192,18 +163,15 @@ def _balanced_assign(coords_deg: np.ndarray, centroids: np.ndarray, K: int, cap:
         choices = np.argsort(d[i])
         placed = False
 
-        # keep balanced first
         for g in choices:
             if counts[g] < soft_target and counts[g] < cap:
                 labels[i] = g
                 counts[g] += 1
                 placed = True
                 break
-
         if placed:
             continue
 
-        # allow up to cap
         for g in choices:
             if counts[g] < cap:
                 labels[i] = g
@@ -218,14 +186,9 @@ def _balanced_assign(coords_deg: np.ndarray, centroids: np.ndarray, K: int, cap:
 
 
 # =========================================================
-# Apply overrides (LOCKED)
+# Overrides (LOCK)
 # =========================================================
 def apply_overrides(df: pd.DataFrame, override_map: dict, K: int, cap: int):
-    """
-    override_map: {_row_id: gidx_target}
-    - Enforce cap: if target is full, skip that override and report.
-    - Mark locked rows with _locked = True
-    """
     df = df.copy()
     df["_locked"] = False
 
@@ -234,22 +197,17 @@ def apply_overrides(df: pd.DataFrame, override_map: dict, K: int, cap: int):
 
     skipped = []
     applied = []
-
-    # counts current
     counts = df["_gidx"].value_counts().to_dict()
 
     for rid, tgt in override_map.items():
-        try:
-            tgt = int(tgt)
-        except Exception:
-            skipped.append((rid, "invalid target"))
-            continue
+        rid = int(rid)
+        tgt = int(tgt)
 
         if tgt < 0 or tgt >= K:
             skipped.append((rid, "target out of range"))
             continue
 
-        rows = df.index[df["_row_id"] == int(rid)]
+        rows = df.index[df["_row_id"] == rid]
         if len(rows) == 0:
             skipped.append((rid, "row_id not found"))
             continue
@@ -262,12 +220,10 @@ def apply_overrides(df: pd.DataFrame, override_map: dict, K: int, cap: int):
             applied.append((rid, cur, tgt, "already"))
             continue
 
-        tgt_count = counts.get(tgt, 0)
-        if tgt_count >= cap:
+        if counts.get(tgt, 0) >= cap:
             skipped.append((rid, f"target {label_from_gidx(tgt)} full"))
             continue
 
-        # move
         df.loc[ix, "_gidx"] = tgt
         df.loc[ix, "_locked"] = True
 
@@ -280,48 +236,44 @@ def apply_overrides(df: pd.DataFrame, override_map: dict, K: int, cap: int):
 
 
 # =========================================================
-# Refinement (optional) — DO NOT MOVE locked points
+# Refinement (from CURRENT labels) — does NOT move locked
 # =========================================================
-def refine_local_knn(
-    coords_deg: np.ndarray,
-    labels: np.ndarray,
-    locked_mask: np.ndarray,
+def refine_from_current(
+    df: pd.DataFrame,
     K: int,
     cap: int,
     refine_iter: int = 6,
     neighbor_k: int = 10,
     seed: int = 42,
+    override_map: dict | None = None,
 ):
     """
-    Iterative local refinement:
-    - kNN (haversine)
-    - vote by neighbors (weighted inverse distance)
-    - move only if improves distance-to-centroid
-    - do NOT move locked points
+    Refine based on df['_gidx'] current state.
+    Locked points (df['_locked']==True) will not move.
+    After refining, overrides are re-applied to ensure "override wins last".
     """
-    if refine_iter <= 0:
-        return labels
+    dfw = df.copy()
+    coords = dfw[["lat", "long"]].to_numpy(dtype=float)
 
-    rng = np.random.default_rng(seed)
-    n = len(labels)
+    labels = dfw["_gidx"].to_numpy(dtype=int)
+    locked_mask = dfw.get("_locked", pd.Series(False, index=dfw.index)).to_numpy(dtype=bool)
 
-    coords_rad = np.radians(coords_deg)
+    # Build knn
+    coords_rad = np.radians(coords)
     tree = BallTree(coords_rad, metric="haversine")
-
-    kq = min(max(2, neighbor_k + 1), n)
+    kq = min(max(2, neighbor_k + 1), len(dfw))
     dist_rad, nbrs = tree.query(coords_rad, k=kq)
     dist_km = dist_rad * 6371.0088
 
-    labels = labels.copy()
+    rng = np.random.default_rng(seed)
     counts = np.bincount(labels, minlength=K)
 
     for it in range(refine_iter):
-        centroids = _compute_centroids(coords_deg, labels, K)
-        order = np.arange(n)
+        centroids = _compute_centroids(coords, labels, K)
+        order = np.arange(len(dfw))
         rng.shuffle(order)
 
         moved = 0
-
         for i in order:
             if locked_mask[i]:
                 continue
@@ -335,13 +287,12 @@ def refine_local_knn(
 
             scores = np.zeros(K, dtype=float)
             w = 1.0 / (nb_dist + 1e-6)
-            nb_lab = labels[nb_idx]
-            for lab, ww in zip(nb_lab, w):
-                scores[int(lab)] += ww
+            for j, ww in zip(nb_idx, w):
+                scores[int(labels[j])] += ww
 
             cand = np.argsort(scores)[::-1]
 
-            p = coords_deg[i]
+            p = coords[i]
             cur_d = np.linalg.norm(p - centroids[gi])
 
             best_g = gi
@@ -352,7 +303,6 @@ def refine_local_knn(
                     continue
                 if counts[g] >= cap:
                     continue
-                # optional: don't move into a cluster if it would immediately push out locked points (not needed here)
                 new_d = np.linalg.norm(p - centroids[g])
                 if new_d + 1e-9 < best_d:
                     best_g, best_d = g, new_d
@@ -367,24 +317,30 @@ def refine_local_knn(
         if moved == 0:
             break
 
-    return labels
+    dfw["_gidx"] = labels.astype(int)
+
+    # reapply overrides to be safe
+    if override_map:
+        dfw, _, _ = apply_overrides(dfw, override_map, K=K, cap=cap)
+
+    dfw["kategori"] = dfw["_gidx"].apply(label_from_gidx)
+    return dfw
 
 
 # =========================================================
-# Map builder (hull + colors + gmaps popup + legend)
+# Map
 # =========================================================
 def build_map(df: pd.DataFrame, K: int):
     center = [df["lat"].mean(), df["long"].mean()]
     m = folium.Map(location=center, zoom_start=11, control_scale=True, tiles="OpenStreetMap")
-
     colors = _palette(K)
 
-    # hull polygons first
+    # hull polygons
     for gi in range(K):
         sub = df[df["_gidx"] == gi]
         if len(sub) < 3:
             continue
-        pts = list(zip(sub["long"].tolist(), sub["lat"].tolist()))  # (lon, lat)
+        pts = list(zip(sub["long"].tolist(), sub["lat"].tolist()))
         hull = _convex_hull(pts)
         if len(hull) < 3:
             continue
@@ -399,7 +355,7 @@ def build_map(df: pd.DataFrame, K: int):
             opacity=0.9,
         ).add_to(m)
 
-    marker_layer = folium.FeatureGroup(name="Toko", show=True).add_to(m)
+    layer = folium.FeatureGroup(name="Toko", show=True).add_to(m)
 
     for _, r in df.iterrows():
         gi = int(r["_gidx"])
@@ -425,19 +381,12 @@ def build_map(df: pd.DataFrame, K: int):
             fill_opacity=0.9,
             tooltip=f"[{int(r['_row_id']):04d}] {r['nama_toko']} ({code})",
             popup=folium.Popup(popup_html, max_width=320),
-        ).add_to(marker_layer)
+        ).add_to(layer)
 
-    Search(
-        layer=marker_layer,
-        search_label="tooltip",
-        placeholder="Cari nama toko / row id ...",
-        collapsed=False,
-    ).add_to(m)
-
+    Search(layer=layer, search_label="tooltip", placeholder="Cari nama toko / row id ...", collapsed=False).add_to(m)
     _add_legend(m, K, colors)
     folium.LayerControl(collapsed=True).add_to(m)
 
-    # fit bounds
     sw = [df["lat"].min(), df["long"].min()]
     ne = [df["lat"].max(), df["long"].max()]
     m.fit_bounds([sw, ne], padding=(20, 20))
@@ -445,76 +394,42 @@ def build_map(df: pd.DataFrame, K: int):
 
 
 # =========================================================
-# Pipeline API
+# Initial grouping pipeline (refine happens only here)
 # =========================================================
-def run_grouping_pipeline(
+def initial_grouping(
     df_clean: pd.DataFrame,
     K: int,
     cap: int,
-    override_map: dict | None = None,
     refine_on: bool = True,
     refine_iter: int = 6,
     neighbor_k: int = 10,
     seed: int = 42,
+    override_map: dict | None = None,
 ):
-    """
-    Returns:
-      df_result: includes _row_id, _gidx, kategori, _locked
-      folium_map
-      applied_overrides, skipped_overrides
-    """
     dfw = df_clean.copy().reset_index(drop=True)
     n = len(dfw)
-
-    if K < 2:
-        raise ValueError("K minimal 2.")
-    if cap < 2:
-        raise ValueError("cap minimal 2.")
     if K * cap < n:
         raise ValueError(f"K*cap tidak cukup. K={K}, cap={cap}, total={n}.")
 
     coords = dfw[["lat", "long"]].to_numpy(dtype=float)
+    soft_target = min(int(math.ceil(n / K)), int(cap))
 
-    soft_target = int(math.ceil(n / K))
-    soft_target = min(soft_target, int(cap))
+    print(f"[INFO] initial_grouping n={n} | K={K} | cap={cap} | soft_target≈{soft_target} | refine_on={refine_on}")
 
-    print(f"[INFO] n={n} | K={K} | cap={cap} | soft_target≈{soft_target} | refine_on={refine_on} | refine_iter={refine_iter} | neighbor_k={neighbor_k}")
-
-    # 1) init centroids via kmeans, then balanced assignment
     centroids = _initial_centroids_kmeans(coords, K=K, seed=seed)
     labels = _balanced_assign(coords, centroids, K=K, cap=int(cap), soft_target=int(soft_target))
 
     dfw["_gidx"] = labels.astype(int)
 
-    # 2) apply overrides (lock)
     override_map = override_map or {}
     dfw, applied, skipped = apply_overrides(dfw, override_map, K=K, cap=int(cap))
 
-    # 3) refine (but do not move locked)
     if refine_on and refine_iter > 0:
-        locked_mask = dfw["_locked"].to_numpy(dtype=bool)
-        labels2 = refine_local_knn(
-            coords_deg=coords,
-            labels=dfw["_gidx"].to_numpy(dtype=int),
-            locked_mask=locked_mask,
-            K=K,
-            cap=int(cap),
-            refine_iter=int(refine_iter),
-            neighbor_k=int(neighbor_k),
-            seed=seed,
+        dfw = refine_from_current(
+            dfw, K=K, cap=int(cap),
+            refine_iter=int(refine_iter), neighbor_k=int(neighbor_k),
+            seed=seed, override_map=override_map
         )
-        dfw["_gidx"] = labels2.astype(int)
 
-        # 4) re-apply overrides to guarantee "override wins last"
-        dfw, applied2, skipped2 = apply_overrides(dfw, override_map, K=K, cap=int(cap))
-        # merge logs (keep moved vs already)
-        applied = applied + applied2
-        skipped = skipped + skipped2
-
-    # final label
     dfw["kategori"] = dfw["_gidx"].apply(label_from_gidx)
-
-    # build map
-    m = build_map(dfw, K=K)
-
-    return dfw, m, applied, skipped
+    return dfw, applied, skipped
